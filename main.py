@@ -1,18 +1,14 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-import models
 import schemas
-from database import SessionLocal, engine
+import firestore_ops
 
-# Create database tables
-models.Base.metadata.create_all(bind=engine)
-
+# Create FastAPI app
 app = FastAPI(title="Camera Visualization API")
 
 # CORS middleware
@@ -25,21 +21,13 @@ app.add_middleware(
 )
 
 # JWT Configuration
-SECRET_KEY = "YOUR_SECRET_KEY"  # Change this in production!
+SECRET_KEY = "YOUR_SECRET_KEY_CHANGE_THIS_IN_PRODUCTION"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-# Dependency to get DB session
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 # Helper functions
 def verify_password(plain_password, hashed_password):
@@ -48,9 +36,9 @@ def verify_password(plain_password, hashed_password):
 def get_password_hash(password):
     return pwd_context.hash(password)
 
-def authenticate_user(db, username: str, password: str):
-    user = db.query(models.User).filter(models.User.username == username).first()
-    if not user or not verify_password(password, user.hashed_password):
+def authenticate_user(username: str, password: str):
+    user = firestore_ops.get_user_by_username(username)
+    if not user or not verify_password(password, user['password']):
         return False
     return user
 
@@ -64,7 +52,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -78,83 +66,98 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         token_data = schemas.TokenData(username=username)
     except JWTError:
         raise credentials_exception
-    user = db.query(models.User).filter(models.User.username == token_data.username).first()
+    
+    user = firestore_ops.get_user_by_username(token_data.username)
     if user is None:
         raise credentials_exception
     return user
 
 # Routes
 @app.post("/token", response_model=schemas.Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = authenticate_user(db, form_data.username, form_data.password)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = authenticate_user(form_data.username, form_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    
+    # Check if user is active
+    if not user.get('isActive', False):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account is disabled",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user.username, "role": user.role}, expires_delta=access_token_expires
+        data={"sub": user["username"], "role": user["role"]}, 
+        expires_delta=access_token_expires
     )
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {"access_token": access_token, "token_type": "bearer", "role": user["role"]}
 
-@app.post("/users/", response_model=schemas.User)
-def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
-    db_user = db.query(models.User).filter(models.User.username == user.username).first()
-    if db_user:
+@app.post("/users/", response_model=schemas.UserResponse)
+async def create_user(user: schemas.UserCreate):
+    # Check if username already exists
+    existing_user = firestore_ops.get_user_by_username(user.username)
+    if existing_user:
         raise HTTPException(status_code=400, detail="Username already registered")
+    
+    # Hash the password
     hashed_password = get_password_hash(user.password)
-    db_user = models.User(
-        username=user.username,
-        email=user.email,
-        hashed_password=hashed_password,
-        role=user.role
-    )
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
+    
+    # Create user data
+    user_data = {
+        "username": user.username,
+        "email": user.email,
+        "password": hashed_password,
+        "role": user.role
+    }
+    
+    # Create user in Firestore
+    db_user = firestore_ops.create_user(user_data)
     return db_user
 
-@app.get("/users/me/", response_model=schemas.User)
-async def read_users_me(current_user: models.User = Depends(get_current_user)):
+@app.get("/users/me/", response_model=schemas.UserResponse)
+async def read_users_me(current_user: dict = Depends(get_current_user)):
     return current_user
 
-@app.get("/cameras/", response_model=List[schemas.Camera])
-async def get_cameras(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # Check user permissions based on role
-    cameras = db.query(models.Camera).all()
-    return cameras
-
-@app.get("/cameras/{camera_id}", response_model=schemas.Camera)
-async def get_camera(camera_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
-    if camera is None:
-        raise HTTPException(status_code=404, detail="Camera not found")
-    return camera
-
-@app.post("/cameras/", response_model=schemas.Camera)
-async def create_camera(camera: schemas.CameraCreate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # Only admin can add cameras
-    if current_user.role != "admin":
+@app.get("/users/", response_model=List[schemas.UserResponse])
+async def read_users(current_user: dict = Depends(get_current_user)):
+    # Only admin can view all users
+    if current_user["role"] != "administrador":
         raise HTTPException(status_code=403, detail="Not enough permissions")
-    db_camera = models.Camera(**camera.dict())
-    db.add(db_camera)
-    db.commit()
-    db.refresh(db_camera)
-    return db_camera
-
-# External camera API integration
-@app.get("/camera-stream/{camera_id}")
-async def get_camera_stream(camera_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
-    if camera is None:
-        raise HTTPException(status_code=404, detail="Camera not found")
     
-    # Here you would integrate with your external camera API
-    # This is a placeholder for the actual implementation
-    return {"stream_url": f"https://camera-api.example.com/stream/{camera.external_id}"}
+    users = firestore_ops.get_all_users()
+    return users
+
+@app.get("/users/{user_id}", response_model=schemas.UserResponse)
+async def read_user(user_id: str, current_user: dict = Depends(get_current_user)):
+    # Only admin or the user themselves can view user details
+    if current_user["role"] != "administrador" and current_user["id"] != user_id:
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+    
+    user = firestore_ops.get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return user
+
+@app.delete("/users/{user_id}")
+async def delete_user(user_id: str, current_user: dict = Depends(get_current_user)):
+    # Only admin can delete users
+    if current_user["role"] != "administrador":
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+    
+    user = firestore_ops.get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    firestore_ops.delete_user(user_id)
+    return {"message": "User deleted successfully"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

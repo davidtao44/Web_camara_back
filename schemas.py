@@ -1,11 +1,12 @@
-from typing import List, Optional
-from pydantic import BaseModel
+from typing import Optional, Any
+from pydantic import BaseModel, EmailStr
 from datetime import datetime
 
 # Token schemas
 class Token(BaseModel):
     access_token: str
     token_type: str
+    role: str
 
 class TokenData(BaseModel):
     username: Optional[str] = None
@@ -17,18 +18,24 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     password: str
-    role: str  # admin, operator, supervisor
+    role: str  # administrador, supervisor, operario
+
+class UserResponse(UserBase):
+    id: str
+    role: str
+    isActive: bool
+    createdAt: Any = None
 
 class User(UserBase):
-    id: int
+    id: str
     role: str
-    is_active: bool
-    created_at: datetime
-
+    isActive: bool
+    createdAt: Any = None
+    
     class Config:
-        orm_mode = True
+        from_attributes = True
 
-# Camera schemas
+# Camera schemas (if needed later)
 class CameraBase(BaseModel):
     name: str
     location: str
@@ -39,9 +46,9 @@ class CameraCreate(CameraBase):
     pass
 
 class Camera(CameraBase):
-    id: int
-    is_active: bool
-    created_at: datetime
-
+    id: str
+    isActive: bool
+    createdAt: Any = None
+    
     class Config:
-        orm_mode = True
+        from_attributes = True
